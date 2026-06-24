@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
 # ═══════════════════════════════════════════════════════════
-#  checkasn — анализ Xray access.log по ASN
+#  checkasn — детектор нарушителей по хостинговым ASN
 #  Snow VPN — https://t.me/SnowfallVPN_bot
 #
+#  Парсит Xray access.log, определяет ASN каждого src IP,
+#  и выдаёт список email-нарушителей которые ходят через
+#  хостинговые/датацентровые ASN — то есть строят цепочку
+#  «пользователь → VPS → Snow VPN», что нарушает оферту
+#  и обычно означает мошенничество / отмыв трафика.
+#
 #  Использование:
-#    ./checkasn                        — топ 20 ASN за 24ч
-#    ./checkasn --hours 6 --top 30     — топ 30 за 6ч
-#    ./checkasn --only-unbanned        — только ASN которых нет в бане
-#    ./checkasn --banned-only          — ТОЛЬКО подключения из забаненных ASN + emails
-#    ./checkasn --emails               — детектор шаринга + email из бан-ASN
-#    ./checkasn --log /path/to/log     — кастомный путь к логу
-#    ./checkasn --no-cache             — принудительно скачать BGP таблицу
+#    checkasn                       — за последние 24ч
+#    checkasn --hours 6             — за 6 часов
+#    checkasn --severity high       — только серьёзные нарушители
+#    checkasn --min-hosting 10      — минимум 10 хостинг-подкл для флага
+#    checkasn --log /path/access.log
+#    checkasn --no-cache            — обновить BGP таблицу принудительно
+#
+#  Конфиг (опционально):
+#    /opt/asn-block/asns.conf       — банлист asn-block.sh
+#    /opt/asn-block/hosting-extra.txt — твои дополнительные ASN (по одному в строку)
 # ═══════════════════════════════════════════════════════════
 
 import argparse
 import gzip
 import ipaddress
-import os
 import re
 import sys
 import time
@@ -26,15 +34,101 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 # ───────────────────────────────────────────────────────────
+#  ВСТРОЕННЫЙ СПИСОК ХОСТИНГОВЫХ ASN
+# ───────────────────────────────────────────────────────────
+# Куратированный список ~70 крупнейших хостингов и датацентров,
+# где обычно живут промежуточные VPS в цепочках VPN-маскировки.
+# Если что-то нужно добавить — клади в /opt/asn-block/hosting-extra.txt
+DEFAULT_HOSTING_ASNS = {
+    # Cloud giants
+    "AS8075":   "Microsoft Azure",
+    "AS15169":  "Google",
+    "AS19527":  "Google Cloud",
+    "AS396982": "Google Cloud (GCP)",
+    "AS16509":  "Amazon AWS",
+    "AS14618":  "Amazon AWS (EC2)",
+    "AS32934":  "Meta (Facebook)",
+    "AS13335":  "Cloudflare",
+    "AS54113":  "Fastly",
+    "AS19551":  "Imperva/Incapsula",
+
+    # Chinese cloud
+    "AS45102":  "Alibaba Cloud",
+    "AS37963":  "Alibaba Cloud CN",
+    "AS55960":  "Alibaba Cloud SG/Intl",
+    "AS136907": "Huawei Cloud",
+    "AS135629": "Huawei Cloud SG",
+    "AS45090":  "Tencent",
+    "AS132203": "Tencent",
+    "AS133199": "Tencent",
+
+    # Major budget VPS (классика для VPN-chaining)
+    "AS24940":  "Hetzner Online",
+    "AS213230": "Hetzner Cloud",
+    "AS51167":  "Contabo",
+    "AS16276":  "OVH SAS",
+    "AS35540":  "OVH",
+    "AS12876":  "Scaleway / Online SAS",
+    "AS14061":  "DigitalOcean",
+    "AS20473":  "Vultr (Choopa)",
+    "AS9009":   "M247",
+    "AS63949":  "Akamai (ex-Linode)",
+    "AS62240":  "Clouvider",
+    "AS47583":  "Hostinger",
+    "AS50673":  "Serverius",
+    "AS199524": "G-Core Labs",
+    "AS197540": "netcup",
+    "AS47602":  "Aruba.it",
+    "AS31898":  "Oracle Cloud",
+    "AS47147":  "ANEXIA",
+    "AS61317":  "Hostkey",
+    "AS395092": "Shock Hosting",
+    "AS134693": "Liteserver",
+    "AS396356": "Latitude.sh",
+
+    # Leaseweb family
+    "AS59253":  "Leaseweb",
+    "AS28753":  "Leaseweb DE",
+    "AS60781":  "Leaseweb NL",
+    "AS30083":  "Leaseweb USA",
+
+    # IPv6 tunnels / proxy infra
+    "AS6939":   "Hurricane Electric",
+
+    # Часто фигурируют в abuse / прокси
+    "AS209103": "AEZA Group",
+    "AS216071": "AEZA Group",
+    "AS210644": "AEZA",
+    "AS44477":  "Stark Industries",
+    "AS47540":  "Stark Industries",
+    "AS208859": "Stark Industries Solutions",
+    "AS25369":  "Tier Net Technologies",
+    "AS62874":  "PhoenixNAP",
+    "AS398101": "GSL Networks",
+    "AS46606":  "Unified Layer",
+
+    # RU/CIS hosting (часто для маскировки под локального юзера)
+    "AS197695": "reg.ru",
+    "AS56694":  "Smart Ape",
+    "AS44066":  "First VDS",
+    "AS207651": "DSHHOSTING",
+    "AS39134":  "Network of digital communications",
+    "AS50113":  "AdminVPS",
+    "AS204603": "ITS-DV LTD",
+    "AS47764":  "VK / Mail.ru hosting",
+}
+
+# ───────────────────────────────────────────────────────────
 #  КОНСТАНТЫ
 # ───────────────────────────────────────────────────────────
 CACHE_DIR = Path("/var/cache/xray-asn-stats")
 BGP_TABLE_URL = "https://bgp.tools/table.txt"
 BGP_ASNAMES_URL = "https://bgp.tools/asns.csv"
 TABLE_TTL_HOURS = 24
-USER_AGENT = "checkasn/1.1 Snow-VPN (t.me/SnowfallVPN_bot)"
+USER_AGENT = "checkasn/2.0 Snow-VPN (t.me/SnowfallVPN_bot)"
 
-BANNED_ASNS_FILE = "/opt/asn-block/asns.conf"
+ASN_BLOCK_CONF = "/opt/asn-block/asns.conf"
+HOSTING_EXTRA_FILE = "/opt/asn-block/hosting-extra.txt"
 
 DEFAULT_LOG_CANDIDATES = [
     "/var/log/remnanode/access.log",
@@ -43,8 +137,6 @@ DEFAULT_LOG_CANDIDATES = [
     "/usr/local/etc/xray/access.log",
 ]
 
-# Xray access.log:
-#   2024/06/15 12:34:56 from 1.2.3.4:50612 accepted //tcp:api.telegram.org:443 [inbound -> direct] email: 177979
 LOG_RE = re.compile(
     r'^(?P<ts>\d{4}/\d{2}/\d{2}\s\d{2}:\d{2}:\d{2})'
     r'.*?(?:from\s+)?'
@@ -69,7 +161,7 @@ def err(msg):
     sys.exit(1)
 
 # ───────────────────────────────────────────────────────────
-#  КЭШИРОВАНИЕ
+#  КЭШИРОВАНИЕ BGP
 # ───────────────────────────────────────────────────────────
 def download(url, dst):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -103,7 +195,7 @@ def ensure_cached(url, filename, force=False):
     return path
 
 # ───────────────────────────────────────────────────────────
-#  BGP LOOKUP
+#  IP → ASN
 # ───────────────────────────────────────────────────────────
 def build_lookup(table_path):
     by_mask = defaultdict(dict)
@@ -152,24 +244,47 @@ def load_asn_names(path):
             m = re.match(r'^"?(\d+)"?\s*,\s*"([^"]*)"', line)
             if not m:
                 continue
-            asn_num, name = m.group(1), m.group(2)
-            names[f"AS{asn_num}"] = name
+            names[f"AS{m.group(1)}"] = m.group(2)
     return names
 
-def load_banned():
-    p = Path(BANNED_ASNS_FILE)
-    if not p.exists():
-        return set()
-    banned = set()
-    with open(p) as f:
-        for line in f:
-            line = line.strip().upper()
-            if line.startswith('AS') and line[2:].isdigit():
-                banned.add(line)
-    return banned
+# ───────────────────────────────────────────────────────────
+#  СПИСОК ХОСТИНГОВЫХ ASN
+# ───────────────────────────────────────────────────────────
+def load_hosting_asns():
+    """Built-in список + asn-block banlist + опциональный hosting-extra.txt."""
+    hosting = dict(DEFAULT_HOSTING_ASNS)
+    sources = ["built-in"]
+
+    p = Path(ASN_BLOCK_CONF)
+    if p.exists():
+        n_added = 0
+        with open(p) as f:
+            for line in f:
+                line = line.strip().upper()
+                if line.startswith('AS') and line[2:].isdigit():
+                    if line not in hosting:
+                        hosting[line] = ""
+                        n_added += 1
+        if n_added > 0:
+            sources.append(f"asn-block (+{n_added})")
+
+    p = Path(HOSTING_EXTRA_FILE)
+    if p.exists():
+        n_added = 0
+        with open(p) as f:
+            for line in f:
+                line = line.strip().upper().split('#')[0].strip()
+                if line.startswith('AS') and line[2:].isdigit():
+                    if line not in hosting:
+                        hosting[line] = ""
+                        n_added += 1
+        if n_added > 0:
+            sources.append(f"hosting-extra (+{n_added})")
+
+    return hosting, sources
 
 # ───────────────────────────────────────────────────────────
-#  ПАРСИНГ ЛОГА
+#  ПАРСИНГ XRAY ЛОГА
 # ───────────────────────────────────────────────────────────
 def find_log_paths(log_path):
     main = Path(log_path)
@@ -216,199 +331,133 @@ def parse_log(log_path, hours):
     info(f"  прочитано строк: {total_lines}, в окне: {matched}")
 
 # ───────────────────────────────────────────────────────────
-#  АГРЕГАЦИЯ
+#  АГРЕГАЦИЯ ПО EMAIL
 # ───────────────────────────────────────────────────────────
-def aggregate(events, lookup_fn):
-    asn_conns = Counter()
-    asn_unique_ips = defaultdict(set)
-    asn_emails = defaultdict(Counter)
-    asn_email_ips = defaultdict(lambda: defaultdict(set))
-    email_asns = defaultdict(set)
-    email_conns = Counter()
-    total = 0
+def aggregate(events, lookup_fn, hosting_asns_set):
+    per_email = defaultdict(lambda: {
+        'total': 0,
+        'hosting_total': 0,
+        'unique_ips': set(),
+        'hosting_ips': set(),
+        'hosting_breakdown': defaultdict(lambda: {'count': 0, 'ips': set()}),
+        'legit_breakdown': Counter(),
+    })
+    grand_total = 0
+    grand_hosting = 0
 
     for ip, email in events:
-        total += 1
+        grand_total += 1
+        if not email:
+            continue
         asn = lookup_fn(ip) or "UNKNOWN"
-        asn_conns[asn] += 1
-        asn_unique_ips[asn].add(ip)
-        if email:
-            asn_emails[asn][email] += 1
-            asn_email_ips[asn][email].add(ip)
-            email_asns[email].add(asn)
-            email_conns[email] += 1
+        d = per_email[email]
+        d['total'] += 1
+        d['unique_ips'].add(ip)
+        if asn in hosting_asns_set:
+            grand_hosting += 1
+            d['hosting_total'] += 1
+            d['hosting_ips'].add(ip)
+            d['hosting_breakdown'][asn]['count'] += 1
+            d['hosting_breakdown'][asn]['ips'].add(ip)
+        else:
+            d['legit_breakdown'][asn] += 1
 
-    return {
-        'total': total,
-        'asn_conns': asn_conns,
-        'asn_unique_ips': asn_unique_ips,
-        'asn_emails': asn_emails,
-        'asn_email_ips': asn_email_ips,
-        'email_asns': email_asns,
-        'email_conns': email_conns,
-    }
+    return per_email, grand_total, grand_hosting
 
 # ───────────────────────────────────────────────────────────
-#  ВЫВОД: общий топ ASN
+#  КЛАССИФИКАЦИЯ
 # ───────────────────────────────────────────────────────────
-def print_asn_table(stats, asn_names, banned_asns, top_n, only_unbanned, banned_only, hours):
-    rows = []
-    for asn, conns in stats['asn_conns'].items():
-        unique = len(stats['asn_unique_ips'][asn])
+def classify(d, min_hosting):
+    h = d['hosting_total']
+    t = d['total']
+    if h < min_hosting:
+        return None
+    pct = (h * 100 / t) if t else 0
+    if pct >= 90:
+        return 'HIGH'
+    if pct >= 30:
+        return 'MED'
+    return 'LOW'
+
+SEVERITY_COLOR = {'HIGH': RED, 'MED': YELLOW, 'LOW': CYAN}
+SEVERITY_ORDER = {'HIGH': 0, 'MED': 1, 'LOW': 2}
+
+# ───────────────────────────────────────────────────────────
+#  ВЫВОД
+# ───────────────────────────────────────────────────────────
+def format_hostings(breakdown, asn_names, max_show=3):
+    items = sorted(
+        breakdown.items(),
+        key=lambda kv: kv[1]['count'],
+        reverse=True,
+    )
+    parts = []
+    for asn, d in items[:max_show]:
         name = asn_names.get(asn, '?')
-        is_banned = asn in banned_asns
-        if only_unbanned and is_banned:
-            continue
-        if banned_only and not is_banned:
-            continue
-        rows.append((asn, name, conns, unique, is_banned))
+        if len(name) > 22:
+            name = name[:21] + '…'
+        parts.append(f"{asn} {name} ({d['count']}п/{len(d['ips'])}IP)")
+    rest = len(items) - max_show
+    if rest > 0:
+        parts.append(f"{DIM}+{rest} ещё{NC}")
+    return "; ".join(parts)
 
-    rows.sort(key=lambda r: r[2], reverse=True)
-    rows = rows[:top_n]
+def print_violators(per_email, grand_total, grand_hosting, asn_names,
+                    min_hosting, filter_severity, hours):
+    violators = []
+    for email, d in per_email.items():
+        sev = classify(d, min_hosting)
+        if sev is None:
+            continue
+        if filter_severity != 'all' and sev != filter_severity.upper():
+            continue
+        violators.append((sev, email, d))
 
-    if not rows:
-        if banned_only:
-            log("Подключений из забаненных ASN не обнаружено — firewall работает чисто 🎯")
-        else:
-            warn("Нечего показывать")
+    violators.sort(key=lambda v: (SEVERITY_ORDER[v[0]], -v[2]['hosting_total']))
+
+    print(f"\n{CYAN}{BOLD}═══ НАРУШИТЕЛИ — подключения с хостинговых ASN "
+          f"(последние {hours}ч) ═══{NC}\n")
+
+    if not violators:
+        log(f"Нарушителей не обнаружено (порог: {min_hosting} хостинг-подкл)")
+        if grand_hosting > 0:
+            info(f"  но {grand_hosting} хостинговых подкл всё же было — "
+                 f"снизь порог через --min-hosting если нужно увидеть")
+        print()
         return
 
-    if banned_only:
-        title = f"Подключения из ЗАБАНЕННЫХ ASN (последние {hours}ч)"
-    elif only_unbanned:
-        title = f"Топ ASN — только НЕ в бане (последние {hours}ч)"
-    else:
-        title = f"Топ ASN по подключениям (последние {hours}ч)"
+    by_sev = Counter(v[0] for v in violators)
 
-    print(f"\n{CYAN}{BOLD}═══ {title} ═══{NC}")
+    email_w = 32
+    print(f"  {'Уровень':<7} {'Email':<{email_w}} {'Подкл':>6} {'IP':>4} "
+          f"{'Хост%':>6}  Хостинги (топ-3)")
+    print("  " + "─" * 110)
 
-    if banned_only:
-        print(f"{DIM}Эти подключения прошли мимо asn-block firewall.{NC}")
-        print(f"{DIM}Возможные причины: префикс отсутствует в bgp.tools таблице,{NC}")
-        print(f"{DIM}отставание обновления ipset, или firewall ещё не применён.{NC}")
+    for sev, email, d in violators:
+        clr = SEVERITY_COLOR[sev]
+        em = (email[:email_w-1] + '…') if len(email) > email_w else email
+        pct = (d['hosting_total'] * 100 / d['total']) if d['total'] else 0
+        hosts = format_hostings(d['hosting_breakdown'], asn_names, max_show=3)
+        sev_tag = f"[{sev:<4}]"
+        print(f"  {clr}{sev_tag}{NC} {em:<{email_w}} "
+              f"{d['total']:>6} {len(d['unique_ips']):>4} "
+              f"{pct:>5.0f}%  {hosts}")
+
+    print("  " + "─" * 110)
+    sev_summary = ", ".join(
+        f"{SEVERITY_COLOR[k]}{by_sev[k]} {k}{NC}"
+        for k in ('HIGH', 'MED', 'LOW') if by_sev.get(k)
+    )
+    pct_global = (grand_hosting * 100 / grand_total) if grand_total else 0
+    print(f"\n  Нарушителей: {BOLD}{len(violators)}{NC}  ({sev_summary})")
+    print(f"  Хостинговых подкл: {grand_hosting} из {grand_total} "
+          f"({pct_global:.1f}% общего трафика)")
     print()
 
-    name_w = 28
-    print(f"{'ASN':<11} {'Имя':<{name_w}} {'Подкл':>8} {'Уник.IP':>9} {'Эмейлов':>9} {'Бан':>5}")
-    print("─" * (11 + 1 + name_w + 1 + 8 + 1 + 9 + 1 + 9 + 1 + 5))
-
-    for asn, name, conns, unique, banned in rows:
-        nm = (name[:name_w-1] + '…') if len(name) > name_w else name
-        n_emails = len(stats['asn_emails'].get(asn, {}))
-        flag = f'{RED}✓{NC}' if banned else ''
-        suspicious = (not banned) and conns > 100 and unique > 0 and (conns / unique) > 20
-
-        if banned:
-            asn_str = f"{RED}{asn}{NC}"
-        elif suspicious:
-            asn_str = f"{YELLOW}{asn}{NC}"
-        else:
-            asn_str = asn
-
-        pad = ' ' * (11 - len(asn))
-        print(f"{asn_str}{pad}{nm:<{name_w}} {conns:>8} {unique:>9} {n_emails:>9} {flag:>5}")
-
-        # Под забаненными ASN — топ-3 email-а
-        if banned and n_emails > 0:
-            top_emails = stats['asn_emails'][asn].most_common(3)
-            for i, (email, ecount) in enumerate(top_emails):
-                ips_count = len(stats['asn_email_ips'][asn][email])
-                is_last_shown = (i == len(top_emails) - 1)
-                more = n_emails > 3
-                prefix = '  ├─' if (not is_last_shown or more) else '  └─'
-                em_show = email[:30] + ('…' if len(email) > 30 else '')
-                print(f"{DIM}{prefix} {em_show:<32} {ecount:>4} подкл, {ips_count} IP{NC}")
-            if n_emails > 3:
-                print(f"{DIM}  └─ … +{n_emails - 3} ещё email'ов{NC}")
-            print()
-
-    print()
-    print(f"{DIM}Всего событий обработано: {stats['total']}{NC}")
-    print(f"{DIM}Уникальных ASN:           {len(stats['asn_conns'])}{NC}")
-    if not banned_only:
-        print(f"{DIM}{RED}Красный{NC}{DIM} — ASN в банлисте (трафик прошёл!).{NC}")
-        print(f"{DIM}{YELLOW}Жёлтый{NC}{DIM} — подозрительный conn/uniqIP > 20.{NC}")
-    print()
-
-# ───────────────────────────────────────────────────────────
-#  ВЫВОД: email c подключениями из забаненных ASN
-# ───────────────────────────────────────────────────────────
-def print_emails_using_banned(stats, banned_asns, top_n=25):
-    suspects = []
-    for email, asns in stats['email_asns'].items():
-        banned_in = asns & banned_asns
-        if not banned_in:
-            continue
-        total = stats['email_conns'][email]
-        banned_count = sum(
-            stats['asn_emails'][asn].get(email, 0) for asn in banned_in
-        )
-        legit_asns = asns - banned_asns
-        suspects.append((email, total, banned_count, banned_in, legit_asns))
-
-    if not suspects:
-        return
-
-    suspects.sort(key=lambda x: x[2], reverse=True)
-    suspects = suspects[:top_n]
-
-    print(f"\n{CYAN}{BOLD}═══ Email с подключениями из ЗАБАНЕННЫХ ASN ═══{NC}")
-    print(f"{DIM}(вероятная цепочка VPN: пользователь → VPS → Snow VPN){NC}\n")
-
-    print(f"{'Email':<32} {'Всего':>6} {'Бан.подкл':>11}  ASN-разбивка")
-    print("─" * 110)
-
-    for email, total, banned_count, banned_in, legit in suspects:
-        pct = (banned_count * 100 / total) if total else 0
-        em = (email[:30] + '…') if len(email) > 31 else email
-        banned_str = ", ".join(sorted(banned_in))
-
-        # формируем строку: красным баны, обычным легит
-        asn_info_parts = [f"{RED}{banned_str}{NC}"]
-        if legit:
-            legit_sorted = sorted(legit)
-            legit_show = ", ".join(legit_sorted[:3])
-            if len(legit) > 3:
-                legit_show += f" +{len(legit)-3}"
-            asn_info_parts.append(f"{DIM}| легит: {legit_show}{NC}")
-        asn_info = "  ".join(asn_info_parts)
-
-        pct_str = f"({pct:>3.0f}%)"
-        print(f"{em:<32} {total:>6} {banned_count:>5} {pct_str:>5}  {asn_info}")
-
-    print()
-    print(f"{DIM}«Бан.подкл» — сколько подключений конкретного email пришло{NC}")
-    print(f"{DIM}с IP в забаненных ASN. 100% — пользователь ходит ТОЛЬКО через VPS,{NC}")
-    print(f"{DIM}явная цепочка прокси. Низкий % + легитимный ASN — возможен шаринг{NC}")
-    print(f"{DIM}ключа между обычным юзером и кем-то на VPS.{NC}\n")
-
-# ───────────────────────────────────────────────────────────
-#  ВЫВОД: шаринг (email с подключениями с многих ASN)
-# ───────────────────────────────────────────────────────────
-def print_sharing(stats, threshold=3, top_n=15):
-    suspects = [
-        (email, asns) for email, asns in stats['email_asns'].items()
-        if len(asns) >= threshold
-    ]
-    if not suspects:
-        info("Шаринг ключей не обнаружен")
-        return
-    suspects.sort(key=lambda x: len(x[1]), reverse=True)
-
-    print(f"\n{CYAN}{BOLD}═══ Подозрительный шаринг ключей ═══{NC}")
-    print(f"{DIM}(email подключается с {threshold}+ разных ASN){NC}\n")
-
-    print(f"{'Email':<32} {'ASN':>5}  Список ASN")
-    print("─" * 90)
-    for email, asns in suspects[:top_n]:
-        em = email[:31]
-        asn_sorted = sorted(asns)
-        shown = asn_sorted[:5]
-        rest = len(asns) - len(shown)
-        asn_list = ", ".join(shown)
-        if rest > 0:
-            asn_list += f" {DIM}+{rest}{NC}"
-        print(f"{em:<32} {len(asns):>5}  {asn_list}")
+    print(f"  {DIM}{RED}[HIGH]{NC}{DIM} ≥90% трафика с хостинга — точно цепочка VPN, на бан{NC}")
+    print(f"  {DIM}{YELLOW}[MED ]{NC}{DIM} 30-89% с хостинга — преимущественно через VPS{NC}")
+    print(f"  {DIM}{CYAN}[LOW ]{NC}{DIM} <30%, но >={min_hosting} хостинг-подкл — "
+          f"проверить вручную{NC}")
     print()
 
 # ───────────────────────────────────────────────────────────
@@ -422,30 +471,23 @@ def detect_log_path():
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Анализ Xray access.log по ASN",
+        description="Детектор нарушителей по хостинговым ASN (Snow VPN)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument('--log', help='Путь к access.log (по умолчанию — автодетект)')
+    ap.add_argument('--log', help='Путь к access.log (по умолчанию автодетект)')
     ap.add_argument('--hours', type=float, default=24,
-                    help='Сколько часов назад смотреть (default: 24)')
-    ap.add_argument('--top', type=int, default=20,
-                    help='Сколько ASN показать (default: 20)')
-
-    mode = ap.add_mutually_exclusive_group()
-    mode.add_argument('--only-unbanned', action='store_true',
-                      help='Показать ТОЛЬКО ASN которых НЕТ в бане (кандидаты)')
-    mode.add_argument('--banned-only', action='store_true',
-                      help='Показать ТОЛЬКО подключения из ЗАБАНЕННЫХ ASN + emails')
-
-    ap.add_argument('--emails', action='store_true',
-                    help='+ детектор шаринга и emails-с-забаненных-ASN')
+                    help='Окно анализа в часах (default: 24)')
+    ap.add_argument('--severity', choices=['all', 'high', 'med', 'low'],
+                    default='all', help='Фильтр по уровню (default: all)')
+    ap.add_argument('--min-hosting', type=int, default=5,
+                    help='Мин. хостинг-подкл чтобы пометить (default: 5)')
     ap.add_argument('--no-cache', action='store_true',
                     help='Принудительно перекачать BGP таблицу')
     args = ap.parse_args()
 
     print(f"{CYAN}{BOLD}")
     print("╔═══════════════════════════════════════════════╗")
-    print("║       checkasn — Snow VPN access analyzer     ║")
+    print("║   checkasn — Snow VPN abuse / chain detector  ║")
     print("╚═══════════════════════════════════════════════╝")
     print(f"{NC}")
 
@@ -464,30 +506,34 @@ def main():
     asn_names = load_asn_names(names_path)
     log(f"  имён: {len(asn_names)}")
 
-    banned = load_banned()
-    info(f"В бане (asn-block): {len(banned)} ASN")
+    info("Собираю список хостинговых ASN...")
+    hosting, sources = load_hosting_asns()
+    for asn in list(hosting.keys()):
+        if not hosting[asn]:
+            hosting[asn] = asn_names.get(asn, '?')
+    hosting_set = set(hosting.keys())
+    log(f"  хостингов: {len(hosting_set)} (источники: {', '.join(sources)})")
 
     info(f"Парсю access.log: {log_path}")
     events = parse_log(log_path, args.hours)
-    stats = aggregate(events, lambda ip: lookup_asn(ip, by_mask))
-
-    if stats['total'] == 0:
-        warn("Нет событий в указанном временном окне")
-        return
-
-    print_asn_table(
-        stats, asn_names, banned, args.top,
-        args.only_unbanned, args.banned_only, args.hours,
+    per_email, grand_total, grand_hosting = aggregate(
+        events,
+        lambda ip: lookup_asn(ip, by_mask),
+        hosting_set,
     )
 
-    # В режиме --banned-only автоматом показываем разбивку по email-ам
-    # (если есть подключения — то есть рядом с таблицей уже виден per-ASN top-3)
-    # Дополнительно — общий список email с любыми банами:
-    if args.banned_only or args.emails:
-        print_emails_using_banned(stats, banned)
+    if grand_total == 0:
+        warn("Нет событий в указанном окне (проверь --hours и путь к логу)")
+        return
 
-    if args.emails:
-        print_sharing(stats)
+    for asn, name in hosting.items():
+        if name and asn not in asn_names:
+            asn_names[asn] = name
+
+    print_violators(
+        per_email, grand_total, grand_hosting, asn_names,
+        args.min_hosting, args.severity, args.hours,
+    )
 
 if __name__ == "__main__":
     try:
