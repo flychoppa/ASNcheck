@@ -36,9 +36,6 @@ from pathlib import Path
 # ───────────────────────────────────────────────────────────
 #  ВСТРОЕННЫЙ СПИСОК ХОСТИНГОВЫХ ASN
 # ───────────────────────────────────────────────────────────
-# Куратированный список ~70 крупнейших хостингов и датацентров,
-# где обычно живут промежуточные VPS в цепочках VPN-маскировки.
-# Если что-то нужно добавить — клади в /opt/asn-block/hosting-extra.txt
 DEFAULT_HOSTING_ASNS = {
     # Cloud giants
     "AS8075":   "Microsoft Azure",
@@ -62,7 +59,7 @@ DEFAULT_HOSTING_ASNS = {
     "AS132203": "Tencent",
     "AS133199": "Tencent",
 
-    # Major budget VPS (классика для VPN-chaining)
+    # Major budget VPS
     "AS24940":  "Hetzner Online",
     "AS213230": "Hetzner Cloud",
     "AS51167":  "Contabo",
@@ -107,7 +104,7 @@ DEFAULT_HOSTING_ASNS = {
     "AS398101": "GSL Networks",
     "AS46606":  "Unified Layer",
 
-    # RU/CIS hosting (часто для маскировки под локального юзера)
+    # RU/CIS hosting
     "AS197695": "reg.ru",
     "AS56694":  "Smart Ape",
     "AS44066":  "First VDS",
@@ -125,7 +122,7 @@ CACHE_DIR = Path("/var/cache/xray-asn-stats")
 BGP_TABLE_URL = "https://bgp.tools/table.txt"
 BGP_ASNAMES_URL = "https://bgp.tools/asns.csv"
 TABLE_TTL_HOURS = 24
-USER_AGENT = "checkasn/2.0 Snow-VPN (t.me/SnowfallVPN_bot)"
+USER_AGENT = "checkasn/2.1 Snow-VPN (t.me/SnowfallVPN_bot)"
 
 ASN_BLOCK_CONF = "/opt/asn-block/asns.conf"
 HOSTING_EXTRA_FILE = "/opt/asn-block/hosting-extra.txt"
@@ -136,6 +133,8 @@ DEFAULT_LOG_CANDIDATES = [
     "/opt/remnanode/access.log",
     "/usr/local/etc/xray/access.log",
 ]
+
+PROGRESS_EVERY = 1_000_000   # сколько строк между прогресс-сообщениями
 
 LOG_RE = re.compile(
     r'^(?P<ts>\d{4}/\d{2}/\d{2}\s\d{2}:\d{2}:\d{2})'
@@ -251,7 +250,6 @@ def load_asn_names(path):
 #  СПИСОК ХОСТИНГОВЫХ ASN
 # ───────────────────────────────────────────────────────────
 def load_hosting_asns():
-    """Built-in список + asn-block banlist + опциональный hosting-extra.txt."""
     hosting = dict(DEFAULT_HOSTING_ASNS)
     sources = ["built-in"]
 
@@ -304,15 +302,46 @@ def parse_log(log_path, hours):
     if not paths:
         err(f"Лог не найден: {log_path}")
 
-    info(f"  файлов лога: {len(paths)}")
+    # === Оптимизация #3: пропуск .gz ротированных файлов с mtime < cutoff ===
+    # У ротированных .gz файл создаётся в момент ротации, и всё содержимое
+    # внутри старше mtime. Значит если mtime < cutoff — внутри ничего не нужно.
+    paths_to_process = []
+    skipped_gz = 0
+    for p in paths:
+        if str(p).endswith('.gz'):
+            try:
+                mtime = datetime.fromtimestamp(p.stat().st_mtime)
+                if mtime < cutoff:
+                    skipped_gz += 1
+                    info(f"  пропускаю {p.name} "
+                         f"(rotated {mtime:%Y-%m-%d %H:%M}, всё старше cutoff)")
+                    continue
+            except OSError:
+                pass
+        paths_to_process.append(p)
+
+    if skipped_gz > 0:
+        info(f"  пропущено .gz файлов по mtime: {skipped_gz}")
+    info(f"  файлов к обработке: {len(paths_to_process)}")
+
+    # === Оптимизация #5: прогресс-индикатор ===
     total_lines = 0
     matched = 0
-    for path in paths:
+    start = time.time()
+
+    for path in paths_to_process:
         opener = gzip.open if str(path).endswith('.gz') else open
         try:
             with opener(path, 'rt', encoding='utf-8', errors='ignore') as f:
                 for line in f:
                     total_lines += 1
+
+                    if total_lines % PROGRESS_EVERY == 0:
+                        elapsed = time.time() - start
+                        rate = total_lines / elapsed if elapsed > 0 else 0
+                        info(f"  {total_lines/1e6:.0f}M строк за {elapsed:.0f}с "
+                             f"({rate/1e6:.2f}M/сек), найдено: {matched}")
+
                     m = LOG_RE.search(line)
                     if not m:
                         continue
@@ -328,7 +357,10 @@ def parse_log(log_path, hours):
             warn(f"  не смог открыть {path}: {e}")
             continue
 
-    info(f"  прочитано строк: {total_lines}, в окне: {matched}")
+    elapsed = time.time() - start
+    rate = total_lines / elapsed if elapsed > 0 else 0
+    info(f"  готово: {total_lines} строк за {elapsed:.1f}с "
+         f"({rate/1e6:.2f}M/сек), событий в окне: {matched}")
 
 # ───────────────────────────────────────────────────────────
 #  АГРЕГАЦИЯ ПО EMAIL
